@@ -16,7 +16,13 @@ def main() -> None:
         if not device_id:
             return
         with lock:
+            is_new = device_id not in discovered
             discovered[device_id] = info
+        if is_new:
+            print(
+                f"\ndiscovered: {device_id} {info.get('device_name')} "
+                f"{info.get('ip')}:{info.get('tcp_port')}"
+            )
 
     def on_text(peer_id: str, text: str) -> None:
         print(f"\n[{peer_id}] {text}")
