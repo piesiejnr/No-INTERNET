@@ -1,3 +1,5 @@
+"""Chunked file transfer over the JSON message channel."""
+
 import base64
 import os
 import uuid
@@ -8,13 +10,16 @@ RECEIVED_DIR = "received"
 
 
 class FileSender:
+    """Generates file metadata and chunk messages for sending."""
     def __init__(self, path: str) -> None:
         self.path = path
         self.file_id = str(uuid.uuid4())
 
     def messages(self) -> Iterable[Dict]:
+        # Yield metadata then base64 chunks for streaming.
         size = os.path.getsize(self.path)
         filename = os.path.basename(self.path)
+        # First message: metadata.
         yield {
             "type": "file_meta",
             "payload": {
@@ -23,11 +28,15 @@ class FileSender:
                 "size": size,
             },
         }
+        # Subsequent messages: chunks in sequence.
         with open(self.path, "rb") as f:
             while True:
+                # Read next chunk from file.
                 chunk = f.read(CHUNK_SIZE)
                 if not chunk:
+                    # EOF reached; done.
                     break
+                # Base64 encode binary data for JSON compatibility.
                 yield {
                     "type": "file_chunk",
                     "payload": {
@@ -38,6 +47,7 @@ class FileSender:
 
 
 class FileReceiver:
+    """Reassembles incoming file chunks to disk."""
     def __init__(self, file_id: str, filename: str, size: int) -> None:
         self.file_id = file_id
         self.filename = filename

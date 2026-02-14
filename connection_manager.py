@@ -1,3 +1,15 @@
+"""Connection management and message routing for TCP peers.
+
+This module is the core networking layer: it owns peer lifecycle (connect, handshake,
+disconnect), routes messages by type, implements direct and group messaging, and
+manages file transfer sessions.
+
+Rationale:
+- Single class (ConnectionManager) owns all peers to enable atomic state updates.
+- Background threads for reads to avoid blocking the main event loop.
+- Master-relay group design chosen for simplicity and ordering guarantees.
+"""
+
 import socket
 import threading
 from typing import Callable, Dict, Optional, Set
@@ -9,6 +21,11 @@ from storage import ChatStore
 
 
 class PeerConnection:
+    """Wraps a TCP socket and handles inbound reads on a background thread.
+    
+    Reason: Isolates per-peer I/O from manager logic; simplifies disconnect cleanup.
+    Each peer gets a dedicated thread to avoid head-of-line blocking if one peer stalls.
+    """
     def __init__(
         self,
         sock: socket.socket,
@@ -27,11 +44,19 @@ class PeerConnection:
         self.running = False
 
     def start(self) -> None:
+        """Spawn background thread to read messages from this peer.
+        
+        Daemon thread means it terminates when main exits; no cleanup needed.
+        """
         self.running = True
         self.thread = threading.Thread(target=self._read_loop, daemon=True)
         self.thread.start()
 
     def send(self, message: Dict) -> None:
+        """Encode and send a message. Blocks until full payload is sent.
+        
+        Reason: sendall ensures atomic delivery; partial writes auto-retried.
+        """
         payload = encode_message(message)
         self.sock.sendall(payload)
 
@@ -47,25 +72,46 @@ class PeerConnection:
             pass
 
     def _read_loop(self) -> None:
+        """Continuously read messages until disconnect or error.
+        
+        Reason: Blocking read is fine; each peer has its own thread.
+        OSError catch handles abrupt disconnects (firewall/network issues).
+        """
         try:
             while self.running:
                 message = read_message(self.sock)
                 if message is None:
+                    # Peer closed cleanly; exit loop.
                     break
+                # Invoke callback in this thread; manager handles routing.
                 self.on_message(self, message)
         except OSError:
-            # Remote closed/reset the connection.
+            # Remote closed/reset the connection abruptly.
+            # Reason: Prevents crash, allows graceful cleanup.
             pass
+        # Always notify manager of disconnect for cleanup.
         self.on_disconnect(self)
 
 
 class ConnectionManager:
+    """Owns peer lifecycle, direct chat, group chat, and file transfer.
+    
+    Central coordinator for all networking. Single instance per client.
+    Reason: Simplifies synchronization; all peer state in one place.
+    
+    Threading model:
+    - One accept thread (server).
+    - One read thread per peer.
+    - Callbacks execute in peer threads; must be thread-safe.
+    """
     def __init__(
         self,
         tcp_port: int,
         on_text: Callable[[str, str], None],
         on_file: Callable[[str, str], None],
         on_group: Callable[[str, str, str], None],
+        on_group_invite: Callable[[str, str, str, str], None],
+        on_group_notice: Callable[[str], None],
         on_peer_connected: Callable[[str, str], None],
         on_peer_disconnected: Callable[[str], None],
         store: ChatStore,
@@ -74,6 +120,8 @@ class ConnectionManager:
         self.on_text = on_text
         self.on_file = on_file
         self.on_group = on_group
+        self.on_group_invite = on_group_invite
+        self.on_group_notice = on_group_notice
         self.on_peer_connected = on_peer_connected
         self.on_peer_disconnected = on_peer_disconnected
         self.store = store
@@ -84,13 +132,19 @@ class ConnectionManager:
         self.file_receivers: Dict[str, FileReceiver] = {}
 
     def start_server(self) -> None:
+        """Bind TCP server and start accepting inbound connections.
+        
+        Reason: Must bind early so discovery broadcasts include correct port.
+        SO_REUSEADDR allows quick restarts without 'address already in use' errors.
+        """
         if self.running:
             return
         self.running = True
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Allow reuse of address for quick restarts during development.
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_sock.bind(("", self.tcp_port))
-        self.server_sock.listen(5)
+        self.server_sock.bind(("", self.tcp_port))  # Bind to all interfaces.
+        self.server_sock.listen(5)  # Backlog for concurrent handshakes.
         self.server_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self.server_thread.start()
 
@@ -102,25 +156,39 @@ class ConnectionManager:
             peer.close()
 
     def connect_to(self, ip: str, port: int) -> bool:
+        """Initiate outbound TCP connection to a peer.
+        
+        Reason: Timeout prevents hanging on unreachable IPs.
+        Returns bool so caller can display error without crashing.
+        """
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # 5 second timeout for connect to fail fast on bad IPs.
         sock.settimeout(5)
         try:
             sock.connect((ip, port))
         except OSError:
+            # Connection refused, timeout, or network unreachable.
             sock.close()
             return False
+        # Clear timeout for normal operation; reads are blocking.
         sock.settimeout(None)
         peer = PeerConnection(sock, self._handle_message, self._handle_disconnect, True)
-        peer.start()
-        self._send_handshake(peer)
+        peer.start()  # Spawn read thread.
+        self._send_handshake(peer)  # Initiate protocol handshake.
         return True
 
     def get_peers(self) -> Dict[str, PeerConnection]:
         return dict(self.peers)
 
     def send_text(self, peer_id: str, text: str) -> None:
+        """Send a direct message to a peer and log it locally.
+        
+        Reason: Local logging ensures message history survives reconnects.
+        Message ID helps de-duplicate if relay logic is added later.
+        """
         peer = self.peers.get(peer_id)
         if not peer:
+            # Peer not connected; silently drop (could notify UI layer).
             return
         message = {
             "type": "message",
@@ -130,7 +198,8 @@ class ConnectionManager:
             "timestamp": get_timestamp(),
             "payload": {"message_id": self._new_message_id(), "text": text},
         }
-        peer.send(message)
+        peer.send(message)  # Send over TCP.
+        # Store locally; receiver also stores it for their own history.
         self.store.append_direct(peer_id, message)
 
     def send_file(self, peer_id: str, path: str) -> None:
@@ -149,14 +218,114 @@ class ConnectionManager:
             )
             peer.send(message)
 
-    def create_group(self, name: str, members: Set[str]) -> str:
+    def create_group(self, name: str) -> str:
+        """Create a new group with this device as master.
+        
+        Reason: Creator is always master to simplify initial state.
+        Broadcast ensures already-connected peers learn about the group.
+        """
         self_id = get_device_id()
-        members.add(self_id)
-        group_id = self.store.create_group(name, list(members), self_id)
+        # Initialize group with only self; invites sent separately.
+        group_id = self.store.create_group(name, [self_id], self_id)
+        # Notify connected peers that we're the master (for future joins).
         self._broadcast_group_master(group_id)
         return group_id
 
+    def invite_to_group(self, group_id: str, members: Set[str]) -> None:
+        """Send group invites to specified peers.
+        
+        Master-only operation to prevent unauthorized invites.
+        Reason: Explicit invite flow gives users control over group membership.
+        """
+        group = self.store.get_group(group_id)
+        if not group:
+            self.on_group_notice("group not found")
+            return
+        if group.get("master_id") != get_device_id():
+            self.on_group_notice("only the master can invite")
+            return
+        for peer_id in members:
+            peer = self.peers.get(peer_id)
+            if not peer:
+                self.on_group_notice(f"peer not connected: {peer_id}")
+                continue
+            message = {
+                "type": "group_invite",
+                "device_id": get_device_id(),
+                "device_name": get_device_name(),
+                "platform": get_platform(),
+                "timestamp": get_timestamp(),
+                "payload": {
+                    "group_id": group_id,
+                    "name": group.get("name"),
+                    "master_id": get_device_id(),
+                    "inviter_id": get_device_id(),
+                },
+            }
+            peer.send(message)
+            self.on_group_notice(f"invite sent to {peer_id}")
+
+    def accept_group_invite(self, group_id: str, master_id: str, name: str) -> None:
+        """Accept a pending group invite and request master to add us.
+        
+        Reason: Two-phase join (accept then master ACK) ensures master controls
+        final member list and prevents race conditions.
+        """
+        # Optimistically create local group state; master will confirm.
+        self.store.upsert_group(
+            group_id,
+            name,
+            [get_device_id(), master_id],
+            master_id,
+            get_timestamp(),
+        )
+        peer = self.peers.get(master_id)
+        if not peer:
+            # Can't join if master is offline; user must retry when connected.
+            self.on_group_notice("master not connected")
+            return
+        # Send join request to master.
+        message = {
+            "type": "group_join",
+            "device_id": get_device_id(),
+            "device_name": get_device_name(),
+            "platform": get_platform(),
+            "timestamp": get_timestamp(),
+            "payload": {
+                "group_id": group_id,
+                "name": name,
+                "from_id": get_device_id(),
+            },
+        }
+        peer.send(message)
+        self.on_group_notice(f"join request sent to master {master_id}")
+
+    def reject_group_invite(self, group_id: str, master_id: str) -> None:
+        # Reject invite and notify the master.
+        peer = self.peers.get(master_id)
+        if not peer:
+            self.on_group_notice("master not connected")
+            return
+        message = {
+            "type": "group_join_reject",
+            "device_id": get_device_id(),
+            "device_name": get_device_name(),
+            "platform": get_platform(),
+            "timestamp": get_timestamp(),
+            "payload": {
+                "group_id": group_id,
+                "from_id": get_device_id(),
+            },
+        }
+        peer.send(message)
+        self.on_group_notice(f"reject sent to master {master_id}")
+
     def send_group_message(self, group_id: str, text: str) -> None:
+        """Send a message to a group via the current master.
+        
+        Reason: Master-relay design ensures total ordering and simplifies logic.
+        Fallback election handles offline master gracefully.
+        """
         group = self.store.get_group(group_id)
         if not group:
             return
@@ -164,13 +333,17 @@ class ConnectionManager:
         members = set(group.get("members", []))
         if self_id not in members:
             members.add(self_id)
+        # Determine which members are currently connected.
         active_members = members.intersection(self.peers.keys()) | {self_id}
         master_id = group.get("master_id")
 
+        # Elect new master if current one is offline.
+        # Reason: Prevents message loss when master disconnects.
         if master_id not in active_members:
             master_id = self._elect_master(active_members)
             self.store.update_group(group_id, {"master_id": master_id, "epoch": get_timestamp()})
             if master_id == self_id:
+                # If we became master, broadcast our authority.
                 self._broadcast_group_master(group_id)
 
         message = {
@@ -188,9 +361,12 @@ class ConnectionManager:
         }
 
         if master_id == self_id:
+            # We are the master; store locally and relay to all members.
             self._store_group_message(group_id, message)
             self._relay_group_message(group_id, message, exclude_id=None)
         else:
+            # We are a slave; send to master for relay.
+            # Reason: Only master relays to prevent message duplication.
             peer = self.peers.get(master_id)
             if peer:
                 peer.send(message)
@@ -215,6 +391,11 @@ class ConnectionManager:
         peer.send(message)
 
     def _broadcast_group_master(self, group_id: str) -> None:
+        """Broadcast master announcement to group members.
+        
+        Reason: Ensures peers have consistent view of group state after
+        master election or new joins.
+        """
         group = self.store.get_group(group_id)
         if not group:
             return
@@ -240,10 +421,19 @@ class ConnectionManager:
                 peer.send(message)
 
     def _store_group_message(self, group_id: str, message: Dict) -> None:
+        """Persist group message and notify UI.
+        
+        Reason: Local storage enables offline replay and history commands.
+        """
         self.store.append_group(group_id, message)
         self.on_group(message.get("device_id", "unknown"), group_id, message.get("payload", {}).get("text", ""))
 
     def _relay_group_message(self, group_id: str, message: Dict, exclude_id: Optional[str]) -> None:
+        """Forward group message to all active members except sender.
+        
+        Reason: Master is single source of truth; prevents duplicate delivery.
+        exclude_id avoids echoing message back to sender.
+        """
         group = self.store.get_group(group_id)
         if not group:
             return
@@ -256,29 +446,50 @@ class ConnectionManager:
             peer.send(message)
 
     def _elect_master(self, active_members: Set[str]) -> str:
+        """Elect new master using deterministic rule.
+        
+        Reason: Lexicographic sort ensures all peers elect the same master
+        without coordination. Prevents split-brain scenarios.
+        """
         return sorted(active_members)[0]
 
     def _new_message_id(self) -> str:
+        """Generate unique message ID for idempotency.
+        
+        Format: <device_id>-<timestamp> ensures uniqueness across peers.
+        Reason: Enables future de-duplication if messages are relayed multiple times.
+        """
         return f"{get_device_id()}-{get_timestamp()}"
 
     def _handle_message(self, peer: PeerConnection, message: Dict) -> None:
+        """Route inbound messages by type to appropriate handlers.
+        
+        Reason: Centralized dispatch simplifies adding new message types.
+        Called from peer's read thread; must be thread-safe.
+        """
         msg_type = message.get("type")
         if msg_type == "handshake":
+            # Extract peer identity from handshake.
             peer.device_id = message.get("device_id")
             peer.device_name = message.get("device_name")
             peer.platform = message.get("platform")
             if peer.device_id:
+                # Register peer in active connections map.
                 self.peers[peer.device_id] = peer
                 self.on_peer_connected(peer.device_id, peer.device_name or "unknown")
+                # Send our current group master state to new peer.
                 self._send_group_state(peer.device_id)
             if not peer.is_outbound:
+                # Inbound connection: send our handshake in response.
                 self._send_handshake(peer)
             return
 
         if msg_type == "message":
+            # Direct message from peer.
             peer_id = message.get("device_id", "unknown")
             text = message.get("payload", {}).get("text", "")
-            self.on_text(peer_id, text)
+            self.on_text(peer_id, text)  # Notify UI.
+            # Store for history; both sides store for consistency.
             self.store.append_direct(peer_id, message)
             return
 
@@ -294,20 +505,97 @@ class ConnectionManager:
                 "epoch": payload.get("epoch", get_timestamp()),
             }
             if self.store.get_group(group_id) is None:
-                self.store.state["groups"][group_id] = update
-                self.store.save()
+                self.store.upsert_group(
+                    group_id,
+                    update.get("name", "group"),
+                    update.get("members", []),
+                    update.get("master_id", ""),
+                    update.get("epoch", get_timestamp()),
+                )
             else:
                 self.store.update_group(group_id, update)
             return
 
-        if msg_type == "group_message":
+        if msg_type == "group_invite":
+            payload = message.get("payload", {})
+            group_id = payload.get("group_id")
+            name = payload.get("name", "group")
+            master_id = payload.get("master_id")
+            inviter_id = payload.get("inviter_id", message.get("device_id", "unknown"))
+            if not group_id or not master_id:
+                return
+            self.on_group_invite(group_id, name, master_id, inviter_id)
+            return
+
+        if msg_type == "group_join":
+            payload = message.get("payload", {})
+            group_id = payload.get("group_id")
+            from_id = payload.get("from_id")
+            if not group_id or not from_id:
+                return
+            group = self.store.get_group(group_id)
+            if not group or group.get("master_id") != get_device_id():
+                return
+            members = set(group.get("members", []))
+            members.add(from_id)
+            self.store.update_group(group_id, {"members": list(members)})
+            ack = {
+                "type": "group_join_ack",
+                "device_id": get_device_id(),
+                "device_name": get_device_name(),
+                "platform": get_platform(),
+                "timestamp": get_timestamp(),
+                "payload": {
+                    "group_id": group_id,
+                    "name": group.get("name"),
+                    "members": sorted(members),
+                    "master_id": get_device_id(),
+                    "epoch": group.get("epoch"),
+                },
+            }
+            peer = self.peers.get(from_id)
+            if peer:
+                peer.send(ack)
+            self._broadcast_group_master(group_id)
+            self.on_group_notice(f"member joined {group_id}: {from_id}")
+            return
+
+        if msg_type == "group_join_ack":
             payload = message.get("payload", {})
             group_id = payload.get("group_id")
             if not group_id:
                 return
+            self.store.upsert_group(
+                group_id,
+                payload.get("name", "group"),
+                payload.get("members", []),
+                payload.get("master_id", ""),
+                payload.get("epoch", get_timestamp()),
+            )
+            self.on_group_notice(f"joined group {group_id}")
+            return
+
+        if msg_type == "group_join_reject":
+            payload = message.get("payload", {})
+            group_id = payload.get("group_id")
+            from_id = payload.get("from_id")
+            if not group_id or not from_id:
+                return
+            self.on_group_notice(f"invite rejected {group_id} by {from_id}")
+            return
+
+        if msg_type == "group_message":
+            # Group message: store locally, relay if we're master.
+            payload = message.get("payload", {})
+            group_id = payload.get("group_id")
+            if not group_id:
+                return
+            # Always store locally for history.
             self._store_group_message(group_id, message)
             group = self.store.get_group(group_id)
             if group and group.get("master_id") == get_device_id():
+                # We're the master; relay to other members.
+                # Reason: Only master relays to prevent message loops.
                 self._relay_group_message(group_id, message, exclude_id=message.get("device_id"))
             return
 

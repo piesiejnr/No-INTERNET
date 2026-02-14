@@ -23,7 +23,10 @@ python main.py
 - `msg <peer_id> <text>`
 - `history <peer_id>`
 - `groups`
-- `group_create <name> <peer_id,peer_id,...>`
+- `group_create <name>`
+- `group_invite <group_id> <peer_id,peer_id,...>`
+- `group_accept <group_id>`
+- `group_reject <group_id>`
 - `group_send <group_id> <text>`
 - `group_history <group_id>`
 - `sendfile <peer_id> <path>`

@@ -1,3 +1,14 @@
+"""CLI entry point for the LynkLAN PC client.
+
+This module provides an interactive command-line interface for the peer-to-peer
+LAN messaging system. It orchestrates discovery, connection management, direct
+messaging, group chat, and file transfer without requiring internet or servers.
+
+Rationale:
+- CLI chosen for PC to enable rapid testing and debugging before GUI.
+- All state kept in callbacks/storage to simplify porting to mobile.
+"""
+
 import threading
 
 from discovery import DiscoveryService
@@ -5,12 +16,15 @@ from connection_manager import ConnectionManager
 from utils import get_device_id, get_device_name
 from storage import ChatStore
 
+# Default TCP port for peer connections. High numbered to avoid conflicts.
 TCP_PORT = 60000
 
 
 def main() -> None:
+    # In-memory caches for CLI display and invite flow.
+    # Reason: Avoid polling storage on every command; only persist critical state.
     discovered = {}
-    lock = threading.Lock()
+    lock = threading.Lock()  # Protects discovered dict from race conditions.
 
     def on_device(info):
         device_id = info.get("device_id")
@@ -25,33 +39,71 @@ def main() -> None:
                 f"{info.get('ip')}:{info.get('tcp_port')}"
             )
 
+    # Callbacks invoked by the connection manager.
+    # Reason: Event-driven architecture decouples networking from UI updates.
     def on_text(peer_id: str, text: str) -> None:
+        """Handle incoming direct messages. Prints to console for visibility."""
         print(f"\n[{peer_id}] {text}")
 
     def on_file(peer_id: str, path: str) -> None:
+        """Notify user when file transfer completes. Path shows where it's saved."""
         print(f"\n[{peer_id}] file received: {path}")
 
+    # Track pending group invites locally so user can accept/reject by group_id.
+    # Reason: Invites are transient and don't need persistent storage.
+    pending_invites = {}
+
     def on_group(peer_id: str, group_id: str, text: str) -> None:
+        """Display group messages with clear group context for multi-group scenarios."""
         print(f"\n[group {group_id}] {peer_id}: {text}")
 
+    def on_group_invite(group_id: str, name: str, master_id: str, inviter_id: str) -> None:
+        """Cache invite and prompt user to accept/reject.
+        
+        Reason: Prevents auto-joining; user controls group membership explicitly.
+        """
+        pending_invites[group_id] = {
+            "name": name,
+            "master_id": master_id,
+            "inviter_id": inviter_id,
+        }
+        print(
+            f"\ninvite: group={group_id} name={name} "
+            f"master={master_id} from={inviter_id}"
+        )
+        print("use: group_accept <group_id> or group_reject <group_id>")
+
+    def on_group_notice(text: str) -> None:
+        """Generic group operation feedback (invites sent, joins, errors)."""
+        print(f"\n[group] {text}")
+
     def on_peer_connected(peer_id: str, name: str) -> None:
+        """Notify on new TCP peer connection for awareness."""
         print(f"\nconnected: {peer_id} ({name})")
 
     def on_peer_disconnected(peer_id: str) -> None:
+        """Notify on peer disconnect; helps diagnose network issues."""
         print(f"\ndisconnected: {peer_id}")
 
+    # Core services: storage, connections, discovery.
+    # Reason: Separate concerns; storage is independent of network layer.
     store = ChatStore()
     manager = ConnectionManager(
         TCP_PORT,
         on_text,
         on_file,
         on_group,
+        on_group_invite,
+        on_group_notice,
         on_peer_connected,
         on_peer_disconnected,
         store,
     )
+    # Start TCP server immediately so we can accept inbound connections.
     manager.start_server()
 
+    # Start UDP broadcast discovery in parallel.
+    # Reason: Passive discovery allows peers to find each other without manual IP entry.
     discovery = DiscoveryService(TCP_PORT, on_device)
     discovery.start()
 
@@ -59,10 +111,13 @@ def main() -> None:
     print(f"Device: {get_device_name()} ({get_device_id()})")
     print("Type 'help' for commands.")
 
+    # Command loop for local interaction.
+    # Reason: Blocking input is fine for CLI; async not needed here.
     while True:
         try:
             line = input("\n> ").strip()
         except (EOFError, KeyboardInterrupt):
+            # Graceful exit on Ctrl+C or Ctrl+D.
             break
         if not line:
             continue
@@ -76,7 +131,10 @@ def main() -> None:
             print("  msg <peer_id> <text>")
             print("  history <peer_id>")
             print("  groups")
-            print("  group_create <name> <peer_id,peer_id,...>")
+            print("  group_create <name>")
+            print("  group_invite <group_id> <peer_id,peer_id,...>")
+            print("  group_accept <group_id>")
+            print("  group_reject <group_id>")
             print("  group_send <group_id> <text>")
             print("  group_history <group_id>")
             print("  sendfile <peer_id> <path>")
@@ -166,15 +224,52 @@ def main() -> None:
             continue
 
         if line.startswith("group_create "):
-            parts = line.split(" ", 2)
-            if len(parts) != 3:
-                print("usage: group_create <name> <peer_id,peer_id,...>")
+            parts = line.split(" ", 1)
+            if len(parts) != 2:
+                print("usage: group_create <name>")
                 continue
             name = parts[1]
+            group_id = manager.create_group(name)
+            print(f"group created: {group_id}")
+            continue
+
+        if line.startswith("group_invite "):
+            parts = line.split(" ", 2)
+            if len(parts) != 3:
+                print("usage: group_invite <group_id> <peer_id,peer_id,...>")
+                continue
+            group_id = parts[1]
             raw_members = [p for p in parts[2].split(",") if p]
             members = set(raw_members)
-            group_id = manager.create_group(name, members)
-            print(f"group created: {group_id}")
+            manager.invite_to_group(group_id, members)
+            continue
+
+        if line.startswith("group_accept "):
+            parts = line.split(" ", 1)
+            if len(parts) != 2:
+                print("usage: group_accept <group_id>")
+                continue
+            group_id = parts[1]
+            invite = pending_invites.get(group_id)
+            if not invite:
+                print("no pending invite")
+                continue
+            manager.accept_group_invite(group_id, invite["master_id"], invite["name"])
+            pending_invites.pop(group_id, None)
+            continue
+
+        if line.startswith("group_reject "):
+            parts = line.split(" ", 1)
+            if len(parts) != 2:
+                print("usage: group_reject <group_id>")
+                continue
+            group_id = parts[1]
+            invite = pending_invites.get(group_id)
+            if not invite:
+                print("no pending invite")
+                continue
+            manager.reject_group_invite(group_id, invite["master_id"])
+            pending_invites.pop(group_id, None)
             continue
 
         if line.startswith("group_send "):

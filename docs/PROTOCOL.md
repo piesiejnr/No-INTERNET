@@ -8,7 +8,7 @@
 
 ```json
 {
-  "type": "handshake | message | group_message | group_master | file_meta | file_chunk | ack",
+  "type": "handshake | message | group_invite | group_join | group_join_ack | group_join_reject | group_message | group_master | file_meta | file_chunk | ack",
   "device_id": "uuid",
   "device_name": "Device Name",
   "platform": "android | ios | pc",
@@ -89,6 +89,76 @@ Discovery Response:
     "members": ["uuid1", "uuid2"],
     "master_id": "uuid1",
     "epoch": 1700000000
+  }
+}
+```
+
+## Group Invite
+
+```json
+{
+  "type": "group_invite",
+  "device_id": "uuid",
+  "device_name": "PC",
+  "platform": "pc",
+  "timestamp": 1700000000,
+  "payload": {
+    "group_id": "uuid",
+    "name": "team-chat",
+    "master_id": "uuid",
+    "inviter_id": "uuid"
+  }
+}
+```
+
+## Group Join Request
+
+```json
+{
+  "type": "group_join",
+  "device_id": "uuid",
+  "device_name": "PC",
+  "platform": "pc",
+  "timestamp": 1700000000,
+  "payload": {
+    "group_id": "uuid",
+    "name": "team-chat",
+    "from_id": "uuid"
+  }
+}
+```
+
+## Group Join Acknowledgement
+
+```json
+{
+  "type": "group_join_ack",
+  "device_id": "uuid",
+  "device_name": "PC",
+  "platform": "pc",
+  "timestamp": 1700000000,
+  "payload": {
+    "group_id": "uuid",
+    "name": "team-chat",
+    "members": ["uuid1", "uuid2"],
+    "master_id": "uuid1",
+    "epoch": 1700000000
+  }
+}
+```
+
+## Group Join Reject
+
+```json
+{
+  "type": "group_join_reject",
+  "device_id": "uuid",
+  "device_name": "PC",
+  "platform": "pc",
+  "timestamp": 1700000000,
+  "payload": {
+    "group_id": "uuid",
+    "from_id": "uuid"
   }
 }
 ```

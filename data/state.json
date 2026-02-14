@@ -1,0 +1,12 @@
+{
+  "groups": {
+    "f7aa62c5-db21-4f0b-91b1-13bbb0070b69": {
+      "epoch": 1771094143,
+      "master_id": "07cdeb0c-b8c2-4d01-a8f3-0d6a35884f8f",
+      "members": [
+        "07cdeb0c-b8c2-4d01-a8f3-0d6a35884f8f"
+      ],
+      "name": "anonymous"
+    }
+  }
+}
