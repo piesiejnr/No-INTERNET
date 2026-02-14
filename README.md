@@ -21,6 +21,11 @@ python main.py
 - `connect <ip> <port>`
 - `connect_discovered <device_id>`
 - `msg <peer_id> <text>`
+- `history <peer_id>`
+- `groups`
+- `group_create <name> <peer_id,peer_id,...>`
+- `group_send <group_id> <text>`
+- `group_history <group_id>`
 - `sendfile <peer_id> <path>`
 - `quit`
 

@@ -8,7 +8,7 @@
 
 ```json
 {
-  "type": "handshake | message | file_meta | file_chunk | ack",
+  "type": "handshake | message | group_message | group_master | file_meta | file_chunk | ack",
   "device_id": "uuid",
   "device_name": "Device Name",
   "platform": "android | ios | pc",
@@ -70,6 +70,43 @@ Discovery Response:
   "timestamp": 1700000000,
   "payload": {
     "text": "Hello from PC"
+  }
+}
+```
+
+## Group Master Announcement
+
+```json
+{
+  "type": "group_master",
+  "device_id": "uuid",
+  "device_name": "PC",
+  "platform": "pc",
+  "timestamp": 1700000000,
+  "payload": {
+    "group_id": "uuid",
+    "name": "team-chat",
+    "members": ["uuid1", "uuid2"],
+    "master_id": "uuid1",
+    "epoch": 1700000000
+  }
+}
+```
+
+## Group Message
+
+```json
+{
+  "type": "group_message",
+  "device_id": "uuid",
+  "device_name": "PC",
+  "platform": "pc",
+  "timestamp": 1700000000,
+  "payload": {
+    "group_id": "uuid",
+    "message_id": "uuid",
+    "from_id": "uuid",
+    "text": "Hello group"
   }
 }
 ```
