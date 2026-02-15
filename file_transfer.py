@@ -39,8 +39,9 @@ from typing import Dict, Iterable, Optional, Callable, Union
 
 # Default chunk sizes for each protocol.
 CHUNK_SIZE_JSON = 64 * 1024  # 64 KB for JSON (smaller, safer)
-CHUNK_SIZE_BINARY = 10 * 1024 * 1024  # 10 MB for binary (no Base64, can be larger)
+CHUNK_SIZE_BINARY = 2 * 1024 * 1024  # 2 MB for binary (balances speed vs hotspot loss)
 RECEIVED_DIR = "received"
+PROFILE_INTERVAL = 10
 
 
 def sanitize_filename(filename: str) -> str:
@@ -242,6 +243,7 @@ class FileReceiver:
         # Track transfer time.
         self.start_time = time.time()
         self.elapsed_time = 0.0
+        self._chunks_received = 0
 
     def write_chunk_json(self, data: str) -> bool:
         """Write a JSON-encoded chunk (Base64).
@@ -264,13 +266,21 @@ class FileReceiver:
         # Write to disk.
         self.file.write(decoded)
         self.bytes_written += len(decoded)
+        self._chunks_received += 1
         
         # Notify UI of progress.
         if self.progress_callback:
             self.progress_callback(self.bytes_written, self.size)
         
         # Return True if transfer complete.
-        return self.bytes_written >= self.size
+        is_complete = self.bytes_written >= self.size
+        if is_complete:
+            self.elapsed_time = time.time() - self.start_time
+        elif self._chunks_received % PROFILE_INTERVAL == 0:
+            elapsed = time.time() - self.start_time
+            rate = (self.bytes_written / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+            print(f"\n[file recv] {self.bytes_written / (1024 * 1024):.2f} MB in {elapsed:.2f}s ({rate:.2f} MB/s)")
+        return is_complete
 
     def write_chunk_binary(self, chunk_index: int, data: bytes) -> bool:
         """Write a binary chunk (no encoding overhead).
@@ -289,6 +299,7 @@ class FileReceiver:
         # Write raw bytes to disk (no decoding needed).
         self.file.write(data)
         self.bytes_written += len(data)
+        self._chunks_received += 1
         
         # Notify UI of progress.
         if self.progress_callback:
@@ -298,6 +309,10 @@ class FileReceiver:
         is_complete = self.bytes_written >= self.size
         if is_complete:
             self.elapsed_time = time.time() - self.start_time
+        elif self._chunks_received % PROFILE_INTERVAL == 0:
+            elapsed = time.time() - self.start_time
+            rate = (self.bytes_written / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+            print(f"\n[file recv] {self.bytes_written / (1024 * 1024):.2f} MB in {elapsed:.2f}s ({rate:.2f} MB/s)")
         return is_complete
 
     def close(self) -> str:

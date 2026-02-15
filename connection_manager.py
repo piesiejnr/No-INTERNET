@@ -277,6 +277,8 @@ class ConnectionManager:
         if not peer:
             return
         sender = FileSender(path)
+        file_size = os.path.getsize(path)
+        bytes_sent = 0
         start_time = time.time()
         chunk_count = 0
         for message in sender.messages():
@@ -293,9 +295,14 @@ class ConnectionManager:
             else:
                 # Binary frames already encoded; send as-is.
                 peer.send(message)
+                bytes_sent += len(message)
                 chunk_count += 1
+                if chunk_count % 10 == 0:
+                    elapsed = time.time() - start_time
+                    rate = (bytes_sent / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                    print(f"\n[file send] {bytes_sent / (1024 * 1024):.2f} MB in {elapsed:.2f}s ({rate:.2f} MB/s)")
         elapsed = time.time() - start_time
-        size_mb = os.path.getsize(path) / (1024 * 1024)
+        size_mb = file_size / (1024 * 1024)
         speed_mbps = size_mb / elapsed if elapsed > 0 else 0
         print(f"\n[file sent] {path} ({size_mb:.2f} MB in {elapsed:.2f}s, {speed_mbps:.2f} MB/s)")
 
