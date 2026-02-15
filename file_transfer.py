@@ -33,12 +33,13 @@ File organization:
 
 import base64
 import os
+import time
 import uuid
 from typing import Dict, Iterable, Optional, Callable, Union
 
 # Default chunk sizes for each protocol.
 CHUNK_SIZE_JSON = 64 * 1024  # 64 KB for JSON (smaller, safer)
-CHUNK_SIZE_BINARY = 512 * 1024  # 512 KB for binary (no Base64, can be larger)
+CHUNK_SIZE_BINARY = 10 * 1024 * 1024  # 10 MB for binary (no Base64, can be larger)
 RECEIVED_DIR = "received"
 
 
@@ -237,6 +238,10 @@ class FileReceiver:
         # Track received chunk indices for future resume support.
         self.received_chunks = set()
         self.last_chunk_index = None
+        
+        # Track transfer time.
+        self.start_time = time.time()
+        self.elapsed_time = 0.0
 
     def write_chunk_json(self, data: str) -> bool:
         """Write a JSON-encoded chunk (Base64).
@@ -290,7 +295,10 @@ class FileReceiver:
             self.progress_callback(self.bytes_written, self.size)
         
         # Return True if transfer complete (reached target size).
-        return self.bytes_written >= self.size
+        is_complete = self.bytes_written >= self.size
+        if is_complete:
+            self.elapsed_time = time.time() - self.start_time
+        return is_complete
 
     def close(self) -> str:
         """Finalize file and return path.

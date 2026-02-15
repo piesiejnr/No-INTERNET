@@ -25,9 +25,11 @@ Threading model safety:
 """
 
 import json
+import os
 import socket
 import struct
 import threading
+import time
 from typing import Callable, Dict, Optional, Set, Union
 
 from protocol import encode_message, read_exact
@@ -275,6 +277,8 @@ class ConnectionManager:
         if not peer:
             return
         sender = FileSender(path)
+        start_time = time.time()
+        chunk_count = 0
         for message in sender.messages():
             if isinstance(message, dict):
                 message.update(
@@ -289,6 +293,11 @@ class ConnectionManager:
             else:
                 # Binary frames already encoded; send as-is.
                 peer.send(message)
+                chunk_count += 1
+        elapsed = time.time() - start_time
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        speed_mbps = size_mb / elapsed if elapsed > 0 else 0
+        print(f"\n[file sent] {path} ({size_mb:.2f} MB in {elapsed:.2f}s, {speed_mbps:.2f} MB/s)")
 
     def create_group(self, name: str) -> str:
         """Create a new group with this device as master.
@@ -691,6 +700,10 @@ class ConnectionManager:
             done = receiver.write_chunk_json(chunk)
             if done:
                 path = receiver.close()
+                elapsed = getattr(receiver, 'elapsed_time', 0.0)
+                size_mb = receiver.size / (1024 * 1024)
+                speed_mbps = size_mb / elapsed if elapsed > 0 else 0
+                print(f"\n[file received] {path} ({size_mb:.2f} MB in {elapsed:.2f}s, {speed_mbps:.2f} MB/s)")
                 self.on_file(peer.device_id or "unknown", path)
                 self.file_receivers.pop(file_id, None)
             return
@@ -723,6 +736,10 @@ class ConnectionManager:
                 done = receiver.write_chunk_binary(chunk_index, chunk_data)
                 if done:
                     path = receiver.close()
+                    elapsed = getattr(receiver, 'elapsed_time', 0.0)
+                    size_mb = receiver.size / (1024 * 1024)
+                    speed_mbps = size_mb / elapsed if elapsed > 0 else 0
+                    print(f"\n[file received] {path} ({size_mb:.2f} MB in {elapsed:.2f}s, {speed_mbps:.2f} MB/s)")
                     self.on_file(peer.device_id or "unknown", path)
                     self.file_receivers.pop(file_id, None)
                 return
