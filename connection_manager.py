@@ -276,15 +276,19 @@ class ConnectionManager:
             return
         sender = FileSender(path)
         for message in sender.messages():
-            message.update(
-                {
-                    "device_id": get_device_id(),
-                    "device_name": get_device_name(),
-                    "platform": get_platform(),
-                    "timestamp": get_timestamp(),
-                }
-            )
-            peer.send(message)
+            if isinstance(message, dict):
+                message.update(
+                    {
+                        "device_id": get_device_id(),
+                        "device_name": get_device_name(),
+                        "platform": get_platform(),
+                        "timestamp": get_timestamp(),
+                    }
+                )
+                peer.send(message)
+            else:
+                # Binary frames already encoded; send as-is.
+                peer.send(message)
 
     def create_group(self, name: str) -> str:
         """Create a new group with this device as master.
