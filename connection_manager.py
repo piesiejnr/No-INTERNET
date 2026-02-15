@@ -24,11 +24,13 @@ Threading model safety:
 - Dictionary access to self.peers protected by implicit GIL (Python dict is atomic for simple ops)
 """
 
+import json
 import socket
+import struct
 import threading
 from typing import Callable, Dict, Optional, Set, Union
 
-from protocol import encode_message, read_message
+from protocol import encode_message, read_exact
 from utils import get_device_id, get_device_name, get_platform, get_timestamp
 from file_transfer import FileReceiver, FileSender, sanitize_filename
 from storage import ChatStore
@@ -49,11 +51,13 @@ class PeerConnection:
         self,
         sock: socket.socket,
         on_message: Callable[["PeerConnection", Dict], None],
+        on_binary: Callable[["PeerConnection", int, bytes], None],
         on_disconnect: Callable[["PeerConnection"], None],
         is_outbound: bool,
     ) -> None:
         self.sock = sock
         self.on_message = on_message
+        self.on_binary = on_binary
         self.on_disconnect = on_disconnect
         self.is_outbound = is_outbound
         self.thread: Optional[threading.Thread] = None
@@ -111,56 +115,36 @@ class PeerConnection:
         """Continuously read messages (JSON or binary) until disconnect.
         
         Reason: Blocking read is fine; each peer has its own thread.
-        Detects frame type (JSON vs binary) and routes to appropriate handler.
-        OSError catch handles abrupt disconnects (firewall/network issues).
-        
-        Protocol detection:
-        - Peek first byte: 0x7B ('{') → JSON, 0x42 ('B') → binary
-        - Read complete message/frame
-        - Route to handler based on type
+        All frames are length-prefixed, so we read the length first, then
+        route based on payload prefix ('{' for JSON, 'BIN' for binary).
         """
         try:
             while self.running:
-                # Peek at first byte to determine protocol.
-                # Reason: Enables multiplexing JSON and binary on same socket.
-                try:
-                    first_byte_data = self.sock.recv(1, socket.MSG_PEEK)
-                    if not first_byte_data:
-                        # Connection closed cleanly.
-                        break
-                    first_byte = first_byte_data[0]
-                except (OSError, AttributeError):
-                    # MSG_PEEK not available; try reading as JSON (most common).
-                    # If that fails, connection is likely broken anyway.
-                    message = read_message(self.sock)
-                    if message is None:
-                        break
-                    self.on_message(self, message)
+                length_bytes = read_exact(self.sock, 4)
+                if not length_bytes:
+                    break
+                length = struct.unpack(">I", length_bytes)[0]
+                if length <= 0:
+                    print("[unknown frame type] 0x0")
+                    break
+                payload = read_exact(self.sock, length)
+                if payload is None:
+                    break
+                if not payload:
                     continue
-                
-                # Route based on first byte.
+
+                first_byte = payload[0]
                 if first_byte == 0x7B:  # '{' → JSON message
-                    message = read_message(self.sock)
-                    if message is None:
-                        # Peer closed cleanly.
+                    try:
+                        message = json.loads(payload.decode("utf-8"))
+                    except json.JSONDecodeError:
+                        print("[protocol error] invalid json payload")
                         break
                     self.on_message(self, message)
-                
-                elif first_byte == 0x42:  # 'B' → Binary frame (0x42 = 'B' from 'BIN')
-                    try:
-                        from binary_protocol import read_binary_frame, BinaryProtocolError
-                        frame_type, frame_data = read_binary_frame(self.sock)
-                        # Route binary frame to handler.
-                        # Reason: Separated from JSON handler to avoid parsing confusion.
-                        self._handle_binary_frame(frame_type, frame_data)
-                    except BinaryProtocolError as e:
-                        # Protocol violation: log and close connection.
-                        # Reason: Unrecoverable frame corruption; close to force reconnect.
-                        print(f"[binary protocol error] {e}")
-                        break
-                
+                elif payload.startswith(b"BIN"):
+                    frame_type = payload[3]
+                    self.on_binary(self, frame_type, payload)
                 else:
-                    # Unknown frame type: protocol violation.
                     print(f"[unknown frame type] {hex(first_byte)}")
                     break
         
@@ -173,13 +157,8 @@ class PeerConnection:
         self.on_disconnect(self)
 
     def _handle_binary_frame(self, frame_type: int, frame_data: bytes) -> None:
-        """Route incoming binary frames to manager.
-        
-        Reason: Structured callback allows manager to track file transfer state.
-        Called from _read_loop; must not block (other peer reads blocked during this).
-        """
-        # This will be delegated to ConnectionManager._handle_binary_frame
-        pass
+        """Route incoming binary frames to manager."""
+        self.on_binary(self, frame_type, frame_data)
 
 
 class ConnectionManager:
@@ -261,7 +240,7 @@ class ConnectionManager:
             return False
         # Clear timeout for normal operation; reads are blocking.
         sock.settimeout(None)
-        peer = PeerConnection(sock, self._handle_message, self._handle_disconnect, True)
+        peer = PeerConnection(sock, self._handle_message, self._handle_binary_frame, self._handle_disconnect, True)
         peer.start()  # Spawn read thread.
         self._send_handshake(peer)  # Initiate protocol handshake.
         return True
@@ -466,7 +445,7 @@ class ConnectionManager:
                 client_sock, _ = self.server_sock.accept()
             except OSError:
                 break
-            peer = PeerConnection(client_sock, self._handle_message, self._handle_disconnect, False)
+            peer = PeerConnection(client_sock, self._handle_message, self._handle_binary_frame, self._handle_disconnect, False)
             peer.start()
 
     def _send_handshake(self, peer: PeerConnection) -> None:
@@ -705,12 +684,46 @@ class ConnectionManager:
             receiver = self.file_receivers.get(file_id)
             if not receiver:
                 return
-            done = receiver.write_chunk(chunk)
+            done = receiver.write_chunk_json(chunk)
             if done:
                 path = receiver.close()
                 self.on_file(peer.device_id or "unknown", path)
                 self.file_receivers.pop(file_id, None)
             return
+
+    def _handle_binary_frame(self, peer: PeerConnection, frame_type: int, frame_data: bytes) -> None:
+        """Handle binary file transfer frames."""
+        try:
+            from binary_protocol import (
+                BinaryProtocolError,
+                FRAME_TYPE_FILE_META,
+                FRAME_TYPE_FILE_CHUNK,
+                decode_binary_file_meta,
+                decode_binary_file_chunk,
+            )
+        except Exception:
+            return
+
+        try:
+            if frame_type == FRAME_TYPE_FILE_META:
+                file_id, filename, size, _compression = decode_binary_file_meta(frame_data)
+                receiver = FileReceiver(file_id, filename, int(size))
+                self.file_receivers[file_id] = receiver
+                return
+
+            if frame_type == FRAME_TYPE_FILE_CHUNK:
+                file_id, chunk_index, _chunk_size, chunk_data = decode_binary_file_chunk(frame_data)
+                receiver = self.file_receivers.get(file_id)
+                if not receiver:
+                    return
+                done = receiver.write_chunk_binary(chunk_index, chunk_data)
+                if done:
+                    path = receiver.close()
+                    self.on_file(peer.device_id or "unknown", path)
+                    self.file_receivers.pop(file_id, None)
+                return
+        except BinaryProtocolError as e:
+            print(f"[binary protocol error] {e}")
 
     def _send_group_state(self, peer_id: str) -> None:
         peer = self.peers.get(peer_id)
