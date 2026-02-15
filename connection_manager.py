@@ -4,19 +4,33 @@ This module is the core networking layer: it owns peer lifecycle (connect, hands
 disconnect), routes messages by type, implements direct and group messaging, and
 manages file transfer sessions.
 
+Supports hybrid protocol:
+- JSON for text messages (control, chat, discovery)
+- Binary for file transfers (efficient, no Base64 overhead)
+
 Rationale:
 - Single class (ConnectionManager) owns all peers to enable atomic state updates.
 - Background threads for reads to avoid blocking the main event loop.
 - Master-relay group design chosen for simplicity and ordering guarantees.
+- Socket write locking prevents concurrent message corruption.
+- Dual protocol detection routes incoming data to appropriate handler.
+- All socket sends protected by lock to maintain frame boundaries.
+
+Threading model safety:
+- One accept thread (server socket, background)
+- One read thread per peer (background)
+- All socket writes protected by PeerConnection.send_lock (thread-safe)
+- All callbacks execute in peer read threads (async to main cli loop)
+- Dictionary access to self.peers protected by implicit GIL (Python dict is atomic for simple ops)
 """
 
 import socket
 import threading
-from typing import Callable, Dict, Optional, Set
+from typing import Callable, Dict, Optional, Set, Union
 
 from protocol import encode_message, read_message
 from utils import get_device_id, get_device_name, get_platform, get_timestamp
-from file_transfer import FileReceiver, FileSender
+from file_transfer import FileReceiver, FileSender, sanitize_filename
 from storage import ChatStore
 
 
@@ -25,6 +39,11 @@ class PeerConnection:
     
     Reason: Isolates per-peer I/O from manager logic; simplifies disconnect cleanup.
     Each peer gets a dedicated thread to avoid head-of-line blocking if one peer stalls.
+    
+    Thread safety:
+    - send_lock protects all socket writes (JSON and binary)
+    - Ensures frame boundaries not corrupted by concurrent sends
+    - Read loop runs in dedicated thread, not shared
     """
     def __init__(
         self,
@@ -42,6 +61,9 @@ class PeerConnection:
         self.device_name: Optional[str] = None
         self.platform: Optional[str] = None
         self.running = False
+        # Lock protects all socket writes from concurrent corruption.
+        # Reason: Multiple threads (CLI + file send + group relay) may call send simultaneously.
+        self.send_lock = threading.Lock()
 
     def start(self) -> None:
         """Spawn background thread to read messages from this peer.
@@ -52,13 +74,27 @@ class PeerConnection:
         self.thread = threading.Thread(target=self._read_loop, daemon=True)
         self.thread.start()
 
-    def send(self, message: Dict) -> None:
-        """Encode and send a message. Blocks until full payload is sent.
+    def send(self, message: Union[Dict, bytes]) -> None:
+        """Encode and send a message or binary data. Thread-safe.
         
         Reason: sendall ensures atomic delivery; partial writes auto-retried.
+        Lock prevents concurrent sends from interleaving (protecting frame boundaries).
+        
+        Args:
+            message: Either JSON dict or binary bytes (from binary_protocol)
         """
-        payload = encode_message(message)
-        self.sock.sendall(payload)
+        # Determine format: JSON dict or binary bytes.
+        if isinstance(message, dict):
+            # JSON message: encode with length prefix.
+            payload = encode_message(message)
+        else:
+            # Binary data: already framed by binary_protocol (includes length).
+            payload = message
+        
+        # Atomic send: no other thread can send between lock and sendall.
+        # Reason: Prevents two messages' bytes interleaving on socket.
+        with self.send_lock:
+            self.sock.sendall(payload)
 
     def close(self) -> None:
         self.running = False
@@ -72,25 +108,78 @@ class PeerConnection:
             pass
 
     def _read_loop(self) -> None:
-        """Continuously read messages until disconnect or error.
+        """Continuously read messages (JSON or binary) until disconnect.
         
         Reason: Blocking read is fine; each peer has its own thread.
+        Detects frame type (JSON vs binary) and routes to appropriate handler.
         OSError catch handles abrupt disconnects (firewall/network issues).
+        
+        Protocol detection:
+        - Peek first byte: 0x7B ('{') → JSON, 0x42 ('B') → binary
+        - Read complete message/frame
+        - Route to handler based on type
         """
         try:
             while self.running:
-                message = read_message(self.sock)
-                if message is None:
-                    # Peer closed cleanly; exit loop.
+                # Peek at first byte to determine protocol.
+                # Reason: Enables multiplexing JSON and binary on same socket.
+                try:
+                    first_byte_data = self.sock.recv(1, socket.MSG_PEEK)
+                    if not first_byte_data:
+                        # Connection closed cleanly.
+                        break
+                    first_byte = first_byte_data[0]
+                except (OSError, AttributeError):
+                    # MSG_PEEK not available; try reading as JSON (most common).
+                    # If that fails, connection is likely broken anyway.
+                    message = read_message(self.sock)
+                    if message is None:
+                        break
+                    self.on_message(self, message)
+                    continue
+                
+                # Route based on first byte.
+                if first_byte == 0x7B:  # '{' → JSON message
+                    message = read_message(self.sock)
+                    if message is None:
+                        # Peer closed cleanly.
+                        break
+                    self.on_message(self, message)
+                
+                elif first_byte == 0x42:  # 'B' → Binary frame (0x42 = 'B' from 'BIN')
+                    try:
+                        from binary_protocol import read_binary_frame, BinaryProtocolError
+                        frame_type, frame_data = read_binary_frame(self.sock)
+                        # Route binary frame to handler.
+                        # Reason: Separated from JSON handler to avoid parsing confusion.
+                        self._handle_binary_frame(frame_type, frame_data)
+                    except BinaryProtocolError as e:
+                        # Protocol violation: log and close connection.
+                        # Reason: Unrecoverable frame corruption; close to force reconnect.
+                        print(f"[binary protocol error] {e}")
+                        break
+                
+                else:
+                    # Unknown frame type: protocol violation.
+                    print(f"[unknown frame type] {hex(first_byte)}")
                     break
-                # Invoke callback in this thread; manager handles routing.
-                self.on_message(self, message)
+        
         except OSError:
             # Remote closed/reset the connection abruptly.
             # Reason: Prevents crash, allows graceful cleanup.
             pass
+        
         # Always notify manager of disconnect for cleanup.
         self.on_disconnect(self)
+
+    def _handle_binary_frame(self, frame_type: int, frame_data: bytes) -> None:
+        """Route incoming binary frames to manager.
+        
+        Reason: Structured callback allows manager to track file transfer state.
+        Called from _read_loop; must not block (other peer reads blocked during this).
+        """
+        # This will be delegated to ConnectionManager._handle_binary_frame
+        pass
 
 
 class ConnectionManager:

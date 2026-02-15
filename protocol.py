@@ -3,10 +3,18 @@
 JSON alone cannot be streamed reliably over TCP because TCP is a byte stream
 without message boundaries. We use a 4-byte length prefix to delimit messages.
 
+This module handles the core JSON protocol for text messages. For efficient
+file transfers, see binary_protocol.py which uses raw binary frames.
+
+Hybrid protocol design:
+- JSON for: discovery, handshakes, text messages, group control (small, infrequent)
+- Binary for: file chunks (large, performance-critical)
+
 Rationale:
 - Length-prefixed framing is simple and efficient.
-- Big-endian ('>I') ensures cross-platform compatibility.
-- JSON chosen for readability and easy extension.
+- Big-endian ('>I') ensures cross-platform compatibility (Windows/Linux/Android/iOS).
+- JSON chosen for readability and easy extension of new message types.
+- Hybrid approach: JSON for clarity where we need it, binary where we need speed.
 """
 
 import json
